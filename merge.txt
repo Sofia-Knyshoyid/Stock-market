@@ -1,0 +1,630 @@
+
+____________________
+from .main import main
+
+
+if __name__ == "__main__":
+    main()
+____________________
+from __future__ import annotations
+
+import os
+import sqlite3
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from threading import Lock
+
+_DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "stock_market.sqlite3"
+DB_PATH = Path(os.getenv("STOCK_MARKET_DB", _DEFAULT_DB_PATH))
+
+_INIT_LOCK = Lock()
+
+
+def _connect(retries: int = 10, delay: float = 0.5) -> sqlite3.Connection:
+    last_err = None
+
+    for _ in range(retries):
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON;")
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.execute("PRAGMA busy_timeout = 5000;")
+            return conn
+        except Exception as e:
+            last_err = e
+            time.sleep(delay)
+
+    raise RuntimeError(f"DB connection failed after retries: {last_err}")
+
+
+@contextmanager
+def connection() -> sqlite3.Connection:
+    conn = _connect()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def initialize_database() -> None:
+    with _INIT_LOCK:
+        with connection() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS wallets (
+                    id TEXT PRIMARY KEY
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS wallet_stocks (
+                    wallet_id TEXT NOT NULL,
+                    stock_name TEXT NOT NULL,
+                    quantity INTEGER NOT NULL CHECK(quantity >= 0),
+                    PRIMARY KEY (wallet_id, stock_name),
+                    FOREIGN KEY (wallet_id) REFERENCES wallets(id) ON DELETE CASCADE
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bank_stocks (
+                    stock_name TEXT PRIMARY KEY,
+                    quantity INTEGER NOT NULL CHECK(quantity >= 0)
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operation_type TEXT NOT NULL,
+                    wallet_id TEXT NOT NULL,
+                    stock_name TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
+
+
+def reset_database() -> None:
+    with connection() as conn:
+        conn.execute("DELETE FROM audit_log;")
+        conn.execute("DELETE FROM wallet_stocks;")
+        conn.execute("DELETE FROM wallets;")
+        conn.execute("DELETE FROM bank_stocks;")
+____________________
+from __future__ import annotations
+
+import argparse
+import os
+import time
+from contextlib import asynccontextmanager
+from typing import Any
+
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Response, Request
+from fastapi.responses import RedirectResponse
+
+from .db import connection, initialize_database
+from .schemas import BankUpdateRequest, TradeRequest
+from .services import trade
+
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        initialize_database()
+    except Exception as e:
+        print(f"[WARN] DB not ready yet: {e}")
+    yield
+
+app = FastAPI(title="Simplified Stock Market", lifespan=lifespan)
+
+
+def wallet_exists(conn, wallet_id: str) -> bool:
+    row = conn.execute("SELECT 1 FROM wallets WHERE id = ?", (wallet_id,)).fetchone()
+    return row is not None
+
+
+@app.get("/")
+def root():
+    return RedirectResponse(url="/docs")
+
+@app.get("/whoami")
+def whoami(request: Request):
+    return {
+        "container": os.getenv("HOSTNAME"),
+    }
+
+
+@app.get("/wallets/{wallet_id}")
+def get_wallet(wallet_id: str) -> dict[str, Any]:
+    with connection() as conn:
+        if not wallet_exists(conn, wallet_id):
+            raise HTTPException(status_code=404, detail="Wallet not found")
+
+        rows = conn.execute(
+            """
+            SELECT stock_name, quantity
+            FROM wallet_stocks
+            WHERE wallet_id = ? AND quantity > 0
+            ORDER BY stock_name
+            """,
+            (wallet_id,),
+        ).fetchall()
+
+        return {
+            "id": wallet_id,
+            "stocks": [
+                {"name": row["stock_name"], "quantity": row["quantity"]}
+                for row in rows
+            ],
+        }
+
+
+@app.get("/wallets/{wallet_id}/stocks/{stock_name}")
+def get_wallet_stock(wallet_id: str, stock_name: str) -> int:
+    with connection() as conn:
+        if not wallet_exists(conn, wallet_id):
+            raise HTTPException(status_code=404, detail="Wallet not found")
+
+        row = conn.execute(
+            """
+            SELECT quantity FROM wallet_stocks
+            WHERE wallet_id = ? AND stock_name = ?
+            """,
+            (wallet_id, stock_name),
+        ).fetchone()
+
+        return 0 if row is None else int(row["quantity"])
+
+
+@app.get("/stocks")
+def get_bank_stocks() -> dict[str, Any]:
+    with connection() as conn:
+        rows = conn.execute(
+            "SELECT stock_name, quantity FROM bank_stocks ORDER BY stock_name"
+        ).fetchall()
+
+        return {
+            "stocks": [
+                {"name": row["stock_name"], "quantity": row["quantity"]}
+                for row in rows
+            ]
+        }
+
+
+@app.post("/stocks")
+def set_bank_stocks(payload: BankUpdateRequest) -> Response:
+    seen = set()
+    for s in payload.stocks:
+        if s.name in seen:
+            raise HTTPException(status_code=400, detail="Duplicate stock name")
+        seen.add(s.name)
+
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE;")
+        try:
+            conn.execute("DELETE FROM bank_stocks;")
+            for s in payload.stocks:
+                conn.execute(
+                    "INSERT INTO bank_stocks (stock_name, quantity) VALUES (?, ?)",
+                    (s.name, s.quantity),
+                )
+            conn.commit()
+        except:
+            conn.rollback()
+            raise
+
+    return Response(status_code=200)
+
+
+@app.post("/wallets/{wallet_id}/stocks/{stock_name}")
+def trade_stock(wallet_id: str, stock_name: str, payload: TradeRequest):
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE;")
+        try:
+            trade(conn, wallet_id, stock_name, payload.type)
+            conn.commit()
+        except HTTPException:
+            conn.rollback()
+            raise
+        except:
+            conn.rollback()
+            raise
+
+    return Response(status_code=200)
+
+
+@app.get("/log")
+def get_log():
+    with connection() as conn:
+        rows = conn.execute(
+            "SELECT operation_type, wallet_id, stock_name FROM audit_log ORDER BY id ASC"
+        ).fetchall()
+
+        return {
+            "log": [
+                {
+                    "type": r["operation_type"],
+                    "wallet_id": r["wallet_id"],
+                    "stock_name": r["stock_name"],
+                }
+                for r in rows
+            ]
+        }
+
+
+
+@app.post("/chaos")
+def chaos():
+    os._exit(1)
+    return {"status": "terminating"}
+
+
+def build_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, required=True)
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+
+    import uvicorn
+
+    uvicorn.run("app.main:app", host=args.host, port=args.port, workers=1)
+____________________
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+class StockItem(BaseModel):
+    name: str = Field(min_length=1)
+    quantity: int = Field(ge=0)
+
+
+class BankUpdateRequest(BaseModel):
+    stocks: list[StockItem]
+
+
+class TradeRequest(BaseModel):
+    type: Literal["buy", "sell"]
+____________________
+from __future__ import annotations
+
+import sqlite3
+from fastapi import HTTPException
+
+
+def ensure_wallet(conn: sqlite3.Connection, wallet_id: str) -> None:
+    row = conn.execute("SELECT 1 FROM wallets WHERE id = ?", (wallet_id,)).fetchone()
+    if row is None:
+        conn.execute("INSERT INTO wallets (id) VALUES (?)", (wallet_id,))
+
+
+def get_bank_stock(conn: sqlite3.Connection, stock_name: str):
+    return conn.execute(
+        "SELECT quantity FROM bank_stocks WHERE stock_name = ?",
+        (stock_name,),
+    ).fetchone()
+
+
+def get_wallet_stock(conn: sqlite3.Connection, wallet_id: str, stock_name: str):
+    return conn.execute(
+        """
+        SELECT quantity FROM wallet_stocks
+        WHERE wallet_id = ? AND stock_name = ?
+        """,
+        (wallet_id, stock_name),
+    ).fetchone()
+
+
+def trade(conn: sqlite3.Connection, wallet_id: str, stock_name: str, op_type: str) -> None:
+    ensure_wallet(conn, wallet_id)
+
+    bank_row = get_bank_stock(conn, stock_name)
+    if bank_row is None:
+        raise HTTPException(status_code=404, detail="Stock not found")
+
+    wallet_row = get_wallet_stock(conn, wallet_id, stock_name)
+
+    if op_type == "buy":
+        if int(bank_row["quantity"]) < 1:
+            raise HTTPException(status_code=400, detail="No stock available in the bank")
+
+        conn.execute(
+            "UPDATE bank_stocks SET quantity = quantity - 1 WHERE stock_name = ?",
+            (stock_name,),
+        )
+
+        if wallet_row is None:
+            conn.execute(
+                "INSERT INTO wallet_stocks (wallet_id, stock_name, quantity) VALUES (?, ?, 1)",
+                (wallet_id, stock_name),
+            )
+        else:
+            conn.execute(
+                "UPDATE wallet_stocks SET quantity = quantity + 1 WHERE wallet_id = ? AND stock_name = ?",
+                (wallet_id, stock_name),
+            )
+
+    else:
+        if wallet_row is None or int(wallet_row["quantity"]) < 1:
+            raise HTTPException(status_code=400, detail="No stock available in the wallet")
+
+        if int(wallet_row["quantity"]) == 1:
+            conn.execute(
+                "DELETE FROM wallet_stocks WHERE wallet_id = ? AND stock_name = ?",
+                (wallet_id, stock_name),
+            )
+        else:
+            conn.execute(
+                "UPDATE wallet_stocks SET quantity = quantity - 1 WHERE wallet_id = ? AND stock_name = ?",
+                (wallet_id, stock_name),
+            )
+
+        conn.execute(
+            "UPDATE bank_stocks SET quantity = quantity + 1 WHERE stock_name = ?",
+            (stock_name,),
+        )
+
+    conn.execute(
+        """
+        INSERT INTO audit_log (operation_type, wallet_id, stock_name)
+        VALUES (?, ?, ?)
+        """,
+        (op_type, wallet_id, stock_name),
+    )
+____________________
+import os
+
+from fastapi.testclient import TestClient
+
+from app.db import DB_PATH, initialize_database, reset_database
+from app.main import app
+
+
+client = TestClient(app)
+
+
+def setup_module(module):
+    if DB_PATH.exists():
+        os.remove(DB_PATH)
+    initialize_database()
+
+
+def setup_function(function):
+    reset_database()
+
+
+def test_initial_state_is_empty():
+    assert client.get("/stocks").status_code == 200
+    assert client.get("/stocks").json() == {"stocks": []}
+    assert client.get("/log").json() == {"log": []}
+
+
+def test_buy_and_sell_flow():
+    assert client.post("/stocks", json={"stocks": [{"name": "st1", "quantity": 2}]}).status_code == 200
+
+    assert client.post("/wallets/w1/stocks/st1", json={"type": "buy"}).status_code == 200
+    assert client.get("/wallets/w1").json() == {"id": "w1", "stocks": [{"name": "st1", "quantity": 1}]}
+    assert client.get("/wallets/w1/stocks/st1").json() == 1
+    assert client.get("/stocks").json() == {"stocks": [{"name": "st1", "quantity": 1}]}
+
+    assert client.post("/wallets/w1/stocks/st1", json={"type": "sell"}).status_code == 200
+    assert client.get("/wallets/w1").json() == {"id": "w1", "stocks": []}
+    assert client.get("/stocks").json() == {"stocks": [{"name": "st1", "quantity": 2}]}
+
+    assert client.get("/log").json() == {
+        "log": [
+            {"type": "buy", "wallet_id": "w1", "stock_name": "st1"},
+            {"type": "sell", "wallet_id": "w1", "stock_name": "st1"},
+        ]
+    }
+
+
+def test_failures_return_proper_status_codes_and_do_not_create_wallets():
+    assert client.post("/stocks", json={"stocks": [{"name": "st1", "quantity": 0}]}).status_code == 200
+
+    response = client.post("/wallets/w1/stocks/st1", json={"type": "buy"})
+    assert response.status_code == 400
+    assert client.get("/wallets/w1").status_code == 404
+
+    response = client.post("/wallets/w1/stocks/missing", json={"type": "buy"})
+    assert response.status_code == 404
+    assert client.get("/wallets/w1").status_code == 404
+
+    response = client.get("/wallets/unknown")
+    assert response.status_code == 404
+
+
+def test_zero_quantity_bank_stocks_are_returned():
+    assert client.post("/stocks", json={"stocks": [{"name": "st1", "quantity": 0}]}).status_code == 200
+    assert client.get("/stocks").json() == {"stocks": [{"name": "st1", "quantity": 0}]}
+____________________
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["gunicorn", "app.main:app", "-k", "uvicorn.workers.UvicornWorker", "-w", "2", "-b", "0.0.0.0:8000"]
+____________________
+version: "3.9"
+
+services:
+  db:
+    image: postgres:15
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: stock
+    ports:
+      - "5432:5432"
+
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/stock
+    depends_on:
+      - db
+    expose:
+      - "8000"
+    restart: always
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8000:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+____________________
+fastapi
+uvicorn
+gunicorn
+pydantic
+psycopg2-binary
+____________________
+# Simplified Stock Market
+
+## Overview
+
+This service simulates a simplified stock market.
+
+## Components
+
+- **Wallets** – hold stocks  
+- **Bank** – central liquidity provider  
+- **Audit log** – tracks all successful wallet operations  
+
+## Assumptions
+
+- Stock price is fixed to 1  
+- No wallet balance is tracked  
+- All operations execute immediately  
+- Bank is the only liquidity provider  
+- System starts empty (no wallets, no stocks)  
+
+---
+
+## API
+
+### Buy / Sell stock
+
+POST /wallets/{wallet_id}/stocks/{stock_name}
+
+Body:
+```json
+{ "type": "buy" }
+```
+
+Rules:
+
+- 404 if stock does not exist  
+- 400 if:
+  - no stock in bank (buy)
+  - no stock in wallet (sell)  
+- 200 on success  
+- wallet is created automatically if it does not exist  
+
+---
+
+### Get wallet
+
+GET /wallets/{wallet_id}
+
+---
+
+### Get wallet stock
+
+GET /wallets/{wallet_id}/stocks/{stock_name}
+
+Returns number (e.g. 5)
+
+---
+
+### Get bank stocks
+
+GET /stocks
+
+---
+
+### Set bank stocks
+
+POST /stocks
+
+---
+
+### Audit log
+
+GET /log
+
+- ordered  
+- only successful operations  
+
+---
+
+### Chaos endpoint
+
+POST /chaos
+
+Kills the instance handling the request.
+
+---
+
+## Running locally
+```
+pip install -r requirements.txt
+```
+```
+python -m app --port 8000
+```
+App available at:
+http://localhost:8000
+
+---
+
+## Running with Docker
+
+docker compose up --build
+
+Apps available at:
+http://localhost:8000
+http://localhost:8001
+
+---
+
+## High Availability
+
+- Multiple instances (docker-compose)
+- Each instance runs multiple workers (gunicorn)
+- This way, killing one instance doesn't stop the system
+
+---
+
+## Testing
+
+pytest
+
+---
+
+## Design decisions
+
+- SQLite with WAL mode for concurrency
+- Transactions for all operations
+- Service layer for business logic
+- FastAPI for REST API
+- Gunicorn for production serving
